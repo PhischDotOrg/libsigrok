@@ -32,6 +32,9 @@
 #ifdef HAVE_LIBUSB_1_0
 #include <libusb.h>
 #endif
+#ifdef HAVE_LIBFTDI
+#include <ftdi.h>
+#endif
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -981,6 +984,21 @@ static inline void write_dblle_inc(uint8_t **p, double x)
 	libusb_handle_events_timeout(ctx, tv)
 #endif
 
+/*
+ * Convenience for FTDI library version dependency.
+ * - Version 1.5 introduced ftdi_tciflush(), ftdi_tcoflush(), and
+ *   ftdi_tcioflush() all within the same commit, and deprecated
+ *   ftdi_usb_purge_buffers() which suffered from inverse semantics.
+ *   The API is drop-in compatible (arguments count and data types are
+ *   identical). The libsigrok source code always flushes RX and TX at
+ *   the same time, never individually.
+ */
+#if defined HAVE_FTDI_TCIOFLUSH && HAVE_FTDI_TCIOFLUSH
+#  define PURGE_FTDI_BOTH ftdi_tcioflush
+#else
+#  define PURGE_FTDI_BOTH ftdi_usb_purge_buffers
+#endif
+
 /* Static definitions of structs ending with an all-zero entry are a
  * problem when compiling with -Wmissing-field-initializers: GCC
  * suppresses the warning only with { 0 }, clang wants { } */
@@ -1916,8 +1934,6 @@ SR_PRIV int serial_stream_detect(struct sr_serial_dev_inst *serial,
 		size_t packet_size, packet_valid_callback is_valid,
 		packet_valid_len_callback is_valid_len, size_t *return_size,
 		uint64_t timeout_ms);
-SR_PRIV int sr_serial_extract_options(GSList *options, const char **serial_device,
-				      const char **serial_options);
 SR_PRIV int serial_source_add(struct sr_session *session,
 		struct sr_serial_dev_inst *serial, int events, int timeout,
 		sr_receive_data_callback cb, void *cb_data);
@@ -1996,6 +2012,9 @@ SR_PRIV const char *ser_hid_chip_find_name_vid_pid(uint16_t vid, uint16_t pid);
 #endif
 #endif
 
+SR_PRIV int sr_serial_extract_options(GSList *options,
+	const char **serial_device, const char **serial_options);
+
 /*--- bt/ API ---------------------------------------------------------------*/
 
 #ifdef HAVE_BLUETOOTH
@@ -2063,7 +2082,9 @@ SR_PRIV gboolean usb_match_manuf_prod(libusb_device *dev,
 
 /** Binary value type */
 enum binary_value_type {
-	BVT_UINT8 = 0,
+	BVT_INVALID,
+
+	BVT_UINT8,
 	BVT_BE_UINT8 = BVT_UINT8,
 	BVT_LE_UINT8 = BVT_UINT8,
 
@@ -2671,6 +2692,9 @@ SR_PRIV int sr_sw_limits_config_set(struct sr_sw_limits *limits, uint32_t key,
 	GVariant *data);
 SR_PRIV void sr_sw_limits_acquisition_start(struct sr_sw_limits *limits);
 SR_PRIV gboolean sr_sw_limits_check(struct sr_sw_limits *limits);
+SR_PRIV int sr_sw_limits_get_remain(const struct sr_sw_limits *limits,
+	uint64_t *samples, uint64_t *frames, uint64_t *msecs,
+	gboolean *exceeded);
 SR_PRIV void sr_sw_limits_update_samples_read(struct sr_sw_limits *limits,
 	uint64_t samples_read);
 SR_PRIV void sr_sw_limits_update_frames_read(struct sr_sw_limits *limits,
@@ -2683,15 +2707,16 @@ struct feed_queue_logic;
 struct feed_queue_analog;
 
 SR_API struct feed_queue_logic *feed_queue_logic_alloc(
-	struct sr_dev_inst *sdi,
+	const struct sr_dev_inst *sdi,
 	size_t sample_count, size_t unit_size);
 SR_API int feed_queue_logic_submit(struct feed_queue_logic *q,
 	const uint8_t *data, size_t count);
 SR_API int feed_queue_logic_flush(struct feed_queue_logic *q);
+SR_API int feed_queue_logic_send_trigger(struct feed_queue_logic *q);
 SR_API void feed_queue_logic_free(struct feed_queue_logic *q);
 
 SR_API struct feed_queue_analog *feed_queue_analog_alloc(
-	struct sr_dev_inst *sdi,
+	const struct sr_dev_inst *sdi,
 	size_t sample_count, int digits, struct sr_channel *ch);
 SR_API int feed_queue_analog_submit(struct feed_queue_analog *q,
 	float data, size_t count);

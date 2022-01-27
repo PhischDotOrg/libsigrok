@@ -33,23 +33,45 @@
 #include "libsigrok-internal.h"
 #include "protocol.h"
 
-#define FPGA_FIRMWARE	"kingst-la2016a-fpga.bitstream"
 #define UC_FIRMWARE	"kingst-la-%04x.fw"
+#define FPGA_FW_LA2016	"kingst-la2016-fpga.bitstream"
+#define FPGA_FW_LA2016A	"kingst-la2016a1-fpga.bitstream"
+#define FPGA_FW_LA1016	"kingst-la1016-fpga.bitstream"
+#define FPGA_FW_LA1016A	"kingst-la1016a1-fpga.bitstream"
 
-#define MAX_SAMPLE_RATE  SR_MHZ(200)
+#define MAX_SAMPLE_RATE_LA2016	SR_MHZ(200)
+#define MAX_SAMPLE_RATE_LA1016	SR_MHZ(100)
 #define MAX_SAMPLE_DEPTH 10e9
 #define MAX_PWM_FREQ     SR_MHZ(20)
-#define PWM_CLOCK        SR_MHZ(200)
+#define PWM_CLOCK        SR_MHZ(200)	/* this is 200MHz for both the LA2016 and LA1016 */
 
-/* registers for control request 32: */
-#define CTRL_RUN         0x00
-#define CTRL_PWM_EN      0x02
-#define CTRL_BULK        0x10 /* can be read to get 12 byte sampling_info (III) */
-#define CTRL_SAMPLING    0x20
-#define CTRL_TRIGGER     0x30
-#define CTRL_THRESHOLD   0x48
-#define CTRL_PWM1        0x70
-#define CTRL_PWM2        0x78
+/* usb vendor class control requests to the cypress FX2 microcontroller */
+#define CMD_FPGA_ENABLE	0x10
+#define CMD_FPGA_SPI	0x20	/* access registers in the FPGA over SPI bus, ctrl_in reads, ctrl_out writes */
+#define CMD_BULK_START	0x30	/* begin transfer of capture data via usb endpoint 6 IN */
+#define CMD_BULK_RESET	0x38	/* flush FX2 usb endpoint 6 IN fifos */
+#define CMD_FPGA_INIT	0x50	/* used before and after FPGA bitstream loading */
+#define CMD_KAUTH	0x60	/* communicate with authentication ic U10, not used */
+#define CMD_EEPROM	0xa2	/* ctrl_in reads, ctrl_out writes */
+
+/*
+ * fpga spi register addresses for control request CMD_FPGA_SPI:
+ * There are around 60 byte-wide registers within the fpga and
+ * these are the base addresses used for accessing them.
+ * On the spi bus, the msb of the address byte is set for read
+ * and cleared for write, but that is handled by the fx2 mcu
+ * as appropriate. In this driver code just use IN transactions
+ * to read, OUT to write.
+ */
+#define REG_RUN		0x00	/* read capture status, write capture start */
+#define REG_PWM_EN	0x02	/* user pwm channels on/off */
+#define REG_CAPT_MODE	0x03	/* set to 0x00 for capture to sdram, 0x01 bypass sdram for streaming */
+#define REG_BULK	0x08	/* write start address and number of bytes for capture data bulk upload */
+#define REG_SAMPLING	0x10	/* write capture config, read capture data location in sdram */
+#define REG_TRIGGER	0x20	/* write level and edge trigger config */
+#define REG_THRESHOLD	0x68	/* write two pwm configs to control input threshold dac */
+#define REG_PWM1	0x70	/* write config for user pwm1 */
+#define REG_PWM2	0x78	/* write config for user pwm2 */
 
 static int ctrl_in(const struct sr_dev_inst *sdi,
 		   uint8_t bRequest, uint16_t wValue, uint16_t wIndex,
@@ -95,7 +117,7 @@ static int ctrl_out(const struct sr_dev_inst *sdi,
 	return SR_OK;
 }
 
-static int upload_fpga_bitstream(const struct sr_dev_inst *sdi)
+static int upload_fpga_bitstream(const struct sr_dev_inst *sdi, const char *bitstream_fname)
 {
 	struct dev_context *devc;
 	struct drv_context *drvc;
@@ -114,18 +136,18 @@ static int upload_fpga_bitstream(const struct sr_dev_inst *sdi)
 	drvc = sdi->driver->context;
 	usb = sdi->conn;
 
-	sr_info("Uploading FPGA bitstream '%s'.", FPGA_FIRMWARE);
+	sr_info("Uploading FPGA bitstream '%s'.", bitstream_fname);
 
-	ret = sr_resource_open(drvc->sr_ctx, &bitstream, SR_RESOURCE_FIRMWARE, FPGA_FIRMWARE);
+	ret = sr_resource_open(drvc->sr_ctx, &bitstream, SR_RESOURCE_FIRMWARE, bitstream_fname);
 	if (ret != SR_OK) {
-		sr_err("could not find la2016 firmware %s!", FPGA_FIRMWARE);
+		sr_err("could not find fpga firmware %s!", bitstream_fname);
 		return ret;
 	}
 
 	devc->bitstream_size = (uint32_t)bitstream.size;
 	wrptr = buffer;
 	write_u32le_inc(&wrptr, devc->bitstream_size);
-	if ((ret = ctrl_out(sdi, 80, 0x00, 0, buffer, wrptr - buffer)) != SR_OK) {
+	if ((ret = ctrl_out(sdi, CMD_FPGA_INIT, 0x00, 0, buffer, wrptr - buffer)) != SR_OK) {
 		sr_err("failed to give upload init command");
 		sr_resource_close(drvc->sr_ctx, &bitstream);
 		return ret;
@@ -168,7 +190,7 @@ static int upload_fpga_bitstream(const struct sr_dev_inst *sdi)
 		return ret;
 	sr_info("FPGA bitstream upload (%" PRIu64 " bytes) done.", bitstream.size);
 
-	if ((ret = ctrl_in(sdi, 80, 0x00, 0, &cmd_resp, sizeof(cmd_resp))) != SR_OK) {
+	if ((ret = ctrl_in(sdi, CMD_FPGA_INIT, 0x00, 0, &cmd_resp, sizeof(cmd_resp))) != SR_OK) {
 		sr_err("failed to read response after FPGA bitstream upload");
 		return ret;
 	}
@@ -179,7 +201,7 @@ static int upload_fpga_bitstream(const struct sr_dev_inst *sdi)
 
 	g_usleep(30000);
 
-	if ((ret = ctrl_out(sdi, 16, 0x01, 0, NULL, 0)) != SR_OK) {
+	if ((ret = ctrl_out(sdi, CMD_FPGA_ENABLE, 0x01, 0, NULL, 0)) != SR_OK) {
 		sr_err("failed enable fpga");
 		return ret;
 	}
@@ -191,26 +213,68 @@ static int upload_fpga_bitstream(const struct sr_dev_inst *sdi)
 static int set_threshold_voltage(const struct sr_dev_inst *sdi, float voltage)
 {
 	struct dev_context *devc;
-	float o1, o2, v1, v2, f;
-	uint32_t cfgval;
-	uint8_t buffer[sizeof(uint32_t)];
-	uint8_t *wrptr;
 	int ret;
 
 	devc = sdi->priv;
-	o1 = 15859969; v1 = 0.45;
-	o2 = 15860333; v2 = 1.65;
-	f = (o2 - o1) / (v2 - v1);
-	cfgval = (uint32_t)(o1 + (voltage - v1) * f);
-	sr_dbg("set threshold voltage %.2fV, raw value 0x%lx",
-		voltage, (unsigned long)cfgval);
 
-	wrptr = buffer;
-	write_u32le_inc(&wrptr, cfgval);
-	ret = ctrl_out(sdi, 32, CTRL_THRESHOLD, 0, buffer, wrptr - buffer);
+	uint16_t duty_R79,duty_R56;
+	uint8_t buf[2 * sizeof(uint16_t)];
+	uint8_t *wrptr;
+
+	/* clamp threshold setting within valid range for LA2016 */
+	if (voltage > 4.0) {
+		voltage = 4.0;
+	}
+	else if (voltage < -4.0) {
+		voltage = -4.0;
+	}
+
+	/*
+	 * The fpga has two programmable pwm outputs which feed a dac that
+	 * is used to adjust input offset. The dac changes the input
+	 * swing around the fixed fpga input threshold.
+	 * The two pwm outputs can be seen on R79 and R56 respectvely.
+	 * Frequency is fixed at 100kHz and duty is varied.
+	 * The R79 pwm uses just three settings.
+	 * The R56 pwm varies with required threshold and its behaviour
+	 * also changes depending on the setting of R79 PWM.
+	 */
+
+	/*
+	 * calculate required pwm duty register values from requested threshold voltage
+	 * see last page of schematic (on wiki) for an explanation of these numbers
+	 */
+	if (voltage >= 2.9) {
+		duty_R79 = 0;		/* this pwm is off (0V)*/
+		duty_R56 = (uint16_t)(302 * voltage - 363);
+	}
+	else if (voltage <= -0.4) {
+		duty_R79 = 0x02D7;	/* 72% duty */
+		duty_R56 = (uint16_t)(302 * voltage + 1090);
+	}
+	else {
+		duty_R79 = 0x00f2;	/* 25% duty */
+		duty_R56 = (uint16_t)(302 * voltage + 121);
+	}
+
+	/* clamp duty register values at sensible limits */
+	if (duty_R56 < 10) {
+		duty_R56 = 10;
+	}
+	else if (duty_R56 > 1100) {
+		duty_R56 = 1100;
+	}
+
+	sr_dbg("set threshold voltage %.2fV", voltage);
+	sr_dbg("duty_R56=0x%04x, duty_R79=0x%04x", duty_R56, duty_R79);
+
+	wrptr = buf;
+	write_u16le_inc(&wrptr, duty_R56);
+	write_u16le_inc(&wrptr, duty_R79);
+
+	ret = ctrl_out(sdi, CMD_FPGA_SPI, REG_THRESHOLD, 0, buf, wrptr - buf);
 	if (ret != SR_OK) {
-		sr_err("Error setting %.2fV threshold voltage (%d)",
-			voltage, ret);
+		sr_err("error setting new threshold voltage of %.2fV", voltage);
 		return ret;
 	}
 	devc->threshold_voltage = voltage;
@@ -231,7 +295,7 @@ static int enable_pwm(const struct sr_dev_inst *sdi, uint8_t p1, uint8_t p2)
 	if (p2) cfg |= 1 << 1;
 
 	sr_dbg("set pwm enable %d %d", p1, p2);
-	ret = ctrl_out(sdi, 32, CTRL_PWM_EN, 0, &cfg, sizeof(cfg));
+	ret = ctrl_out(sdi, CMD_FPGA_SPI, REG_PWM_EN, 0, &cfg, sizeof(cfg));
 	if (ret != SR_OK) {
 		sr_err("error setting new pwm enable 0x%02x", cfg);
 		return ret;
@@ -244,7 +308,7 @@ static int enable_pwm(const struct sr_dev_inst *sdi, uint8_t p1, uint8_t p2)
 
 static int set_pwm(const struct sr_dev_inst *sdi, uint8_t which, float freq, float duty)
 {
-	int CTRL_PWM[] = { CTRL_PWM1, CTRL_PWM2 };
+	int CTRL_PWM[] = { REG_PWM1, REG_PWM2 };
 	struct dev_context *devc;
 	pwm_setting_dev_t cfg;
 	pwm_setting_t *setting;
@@ -274,7 +338,7 @@ static int set_pwm(const struct sr_dev_inst *sdi, uint8_t which, float freq, flo
 	wrptr = buf;
 	write_u32le_inc(&wrptr, cfg.period);
 	write_u32le_inc(&wrptr, cfg.duty);
-	ret = ctrl_out(sdi, 32, CTRL_PWM[which - 1], 0, buf, wrptr - buf);
+	ret = ctrl_out(sdi, CMD_FPGA_SPI, CTRL_PWM[which - 1], 0, buf, wrptr - buf);
 	if (ret != SR_OK) {
 		sr_err("error setting new pwm%d config %d %d", which, cfg.period, cfg.duty);
 		return ret;
@@ -296,7 +360,7 @@ static int set_defaults(const struct sr_dev_inst *sdi)
 	devc->capture_ratio = 5; /* percent */
 	devc->cur_channels = 0xffff;
 	devc->limit_samples = 5000000;
-	devc->cur_samplerate = 200000000;
+	devc->cur_samplerate = SR_MHZ(100);
 
 	ret = set_threshold_voltage(sdi, devc->threshold_voltage);
 	if (ret)
@@ -399,7 +463,7 @@ static int set_trigger_config(const struct sr_dev_inst *sdi)
 	write_u32le_inc(&wrptr, cfg.enabled);
 	write_u32le_inc(&wrptr, cfg.level);
 	write_u32le_inc(&wrptr, cfg.high_or_falling);
-	ret = ctrl_out(sdi, 32, CTRL_TRIGGER, 16, buf, wrptr - buf);
+	ret = ctrl_out(sdi, CMD_FPGA_SPI, REG_TRIGGER, 16, buf, wrptr - buf);
 	if (ret != SR_OK) {
 		sr_err("error setting trigger config!");
 		return ret;
@@ -412,7 +476,6 @@ static int set_sample_config(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc;
 	double clock_divisor;
-	uint64_t psa;
 	uint64_t total;
 	int ret;
 	uint16_t divisor;
@@ -422,16 +485,16 @@ static int set_sample_config(const struct sr_dev_inst *sdi)
 	devc = sdi->priv;
 	total = 128 * 1024 * 1024;
 
-	if (devc->cur_samplerate > MAX_SAMPLE_RATE) {
+	if (devc->cur_samplerate > devc->max_samplerate) {
 		sr_err("too high sample rate: %" PRIu64, devc->cur_samplerate);
 		return SR_ERR;
 	}
 
-	clock_divisor = MAX_SAMPLE_RATE / (double)devc->cur_samplerate;
+	clock_divisor = devc->max_samplerate / (double)devc->cur_samplerate;
 	if (clock_divisor > 0xffff)
 		clock_divisor = 0xffff;
 	divisor = (uint16_t)(clock_divisor + 0.5);
-	devc->cur_samplerate = MAX_SAMPLE_RATE / divisor;
+	devc->cur_samplerate = devc->max_samplerate / divisor;
 
 	if (devc->limit_samples > MAX_SAMPLE_DEPTH) {
 		sr_err("too high sample depth: %" PRIu64, devc->limit_samples);
@@ -443,14 +506,15 @@ static int set_sample_config(const struct sr_dev_inst *sdi)
 	sr_dbg("set sampling configuration %.0fkHz, %d samples, trigger-pos %d%%",
 	       devc->cur_samplerate / 1e3, (unsigned int)devc->limit_samples, (unsigned int)devc->capture_ratio);
 
-	psa = devc->pre_trigger_size * 256;
 	wrptr = buf;
 	write_u32le_inc(&wrptr, devc->limit_samples);
-	write_u48le_inc(&wrptr, psa);
-	write_u32le_inc(&wrptr, (total * devc->capture_ratio) / 100);
-	write_u16le_inc(&wrptr, clock_divisor);
+	write_u8_inc(&wrptr, 0);
+	write_u32le_inc(&wrptr, devc->pre_trigger_size);
+	write_u32le_inc(&wrptr, ((total * devc->capture_ratio) / 100) & 0xFFFFFF00);
+	write_u16le_inc(&wrptr, divisor);
+	write_u8_inc(&wrptr, 0);
 
-	ret = ctrl_out(sdi, 32, CTRL_SAMPLING, 0, buf, wrptr - buf);
+	ret = ctrl_out(sdi, CMD_FPGA_SPI, REG_SAMPLING, 0, buf, wrptr - buf);
 	if (ret != SR_OK) {
 		sr_err("error setting sample config!");
 		return ret;
@@ -459,24 +523,58 @@ static int set_sample_config(const struct sr_dev_inst *sdi)
 	return SR_OK;
 }
 
-/**
- * lowest 2 bit are probably:
- * 2: recording
- * 1: finished
- * next 2 bit indicate whether we are still waiting for triggering
- * 0: waiting
- * 3: triggered
+/* The run state is read from FPGA registers 1[hi-byte] and 0[lo-byte]
+ * and the bits are interpreted as follows:
+ *
+ * register 0:
+ *	bit0 1=	idle
+ *	bit1 1=	writing to sdram
+ *	bit2 0=	waiting_for_trigger 1=been_triggered
+ *	bit3 0=	pretrigger_sampling 1=posttrigger_sampling
+ * 	...unknown...
+ * register 1:
+ *	meaning of bits unknown (but vendor software reads this, so just do the same)
+ *
+ * The run state values occur in this order:
+ * 0x85E2: pre-sampling (for samples before trigger position, capture ratio > 0%)
+ * 0x85EA: pre-sampling complete, now waiting for trigger (whilst sampling continuously)
+ * 0x85EE: running
+ * 0x85ED: idle
  */
 static uint16_t run_state(const struct sr_dev_inst *sdi)
 {
 	uint16_t state;
+	static uint16_t previous_state = 0;
 	int ret;
 
-	if ((ret = ctrl_in(sdi, 32, CTRL_RUN, 0, &state, sizeof(state))) != SR_OK) {
+	if ((ret = ctrl_in(sdi, CMD_FPGA_SPI, REG_RUN, 0, &state, sizeof(state))) != SR_OK) {
 		sr_err("failed to read run state!");
 		return ret;
 	}
-	sr_dbg("run_state: 0x%04x", state);
+
+	/* This function is called about every 50ms.
+	 * To avoid filling the log file with redundant information during long captures,
+	 * just print a log message if status has changed.
+	 */
+
+	if (state != previous_state) {
+		previous_state = state;
+		if ((state & 0x0003) == 0x01) {
+			sr_dbg("run_state: 0x%04x (%s)", state, "idle");
+		}
+		else if ((state & 0x000f) == 0x02) {
+			sr_dbg("run_state: 0x%04x (%s)", state, "pre-trigger sampling");
+		}
+		else if ((state & 0x000f) == 0x0a) {
+			sr_dbg("run_state: 0x%04x (%s)", state, "sampling, waiting for trigger");
+		}
+		else if ((state & 0x000f) == 0x0e) {
+			sr_dbg("run_state: 0x%04x (%s)", state, "post-trigger sampling");
+		}
+		else {
+			sr_dbg("run_state: 0x%04x", state);
+		}
+	}
 
 	return state;
 }
@@ -485,7 +583,7 @@ static int set_run_mode(const struct sr_dev_inst *sdi, uint8_t fast_blinking)
 {
 	int ret;
 
-	if ((ret = ctrl_out(sdi, 32, CTRL_RUN, 0, &fast_blinking, sizeof(fast_blinking))) != SR_OK) {
+	if ((ret = ctrl_out(sdi, CMD_FPGA_SPI, REG_RUN, 0, &fast_blinking, sizeof(fast_blinking))) != SR_OK) {
 		sr_err("failed to send set-run-mode command %d", fast_blinking);
 		return ret;
 	}
@@ -502,7 +600,7 @@ static int get_capture_info(const struct sr_dev_inst *sdi)
 
 	devc = sdi->priv;
 
-	if ((ret = ctrl_in(sdi, 32, CTRL_BULK, 0, buf, sizeof(buf))) != SR_OK) {
+	if ((ret = ctrl_in(sdi, CMD_FPGA_SPI, REG_SAMPLING, 0, buf, sizeof(buf))) != SR_OK) {
 		sr_err("failed to read capture info!");
 		return ret;
 	}
@@ -543,7 +641,7 @@ SR_PRIV int la2016_setup_acquisition(const struct sr_dev_inst *sdi)
 		return ret;
 
 	cmd = 0;
-	if ((ret = ctrl_out(sdi, 32, 0x03, 0, &cmd, sizeof(cmd))) != SR_OK) {
+	if ((ret = ctrl_out(sdi, CMD_FPGA_SPI, REG_CAPT_MODE, 0, &cmd, sizeof(cmd))) != SR_OK) {
 		sr_err("failed to send stop sampling command");
 		return ret;
 	}
@@ -607,7 +705,7 @@ SR_PRIV int la2016_start_retrieval(const struct sr_dev_inst *sdi, libusb_transfe
 	sr_dbg("want to read %d tfer-packets starting from pos %d",
 	       devc->n_transfer_packets_to_read, devc->read_pos);
 
-	if ((ret = ctrl_out(sdi, 56, 0x00, 0, NULL, 0)) != SR_OK) {
+	if ((ret = ctrl_out(sdi, CMD_BULK_RESET, 0x00, 0, NULL, 0)) != SR_OK) {
 		sr_err("failed to reset bulk state");
 		return ret;
 	}
@@ -615,19 +713,21 @@ SR_PRIV int la2016_start_retrieval(const struct sr_dev_inst *sdi, libusb_transfe
 	wrptr = wrbuf;
 	write_u32le_inc(&wrptr, devc->read_pos);
 	write_u32le_inc(&wrptr, devc->n_bytes_to_read);
-	if ((ret = ctrl_out(sdi, 32, CTRL_BULK, 0, wrbuf, wrptr - wrbuf)) != SR_OK) {
+	if ((ret = ctrl_out(sdi, CMD_FPGA_SPI, REG_BULK, 0, wrbuf, wrptr - wrbuf)) != SR_OK) {
 		sr_err("failed to send bulk config");
 		return ret;
 	}
-	if ((ret = ctrl_out(sdi, 48, 0x00, 0, NULL, 0)) != SR_OK) {
+	if ((ret = ctrl_out(sdi, CMD_BULK_START, 0x00, 0, NULL, 0)) != SR_OK) {
 		sr_err("failed to unblock bulk transfers");
 		return ret;
 	}
 
 	to_read = devc->n_bytes_to_read;
-	if (to_read > LA2016_BULK_MAX)
-		to_read = LA2016_BULK_MAX;
-
+	/* choose a buffer size for all of the usb transfers */
+	if (to_read >= LA2016_USB_BUFSZ)
+		to_read = LA2016_USB_BUFSZ; /* multiple transfers */
+	else /* one transfer, make buffer size some multiple of LA2016_EP6_PKTSZ */
+		to_read = (to_read + (LA2016_EP6_PKTSZ-1)) & ~(LA2016_EP6_PKTSZ-1);
 	buffer = g_try_malloc(to_read);
 	if (!buffer) {
 		sr_err("Failed to allocate %d bytes for bulk transfer", to_read);
@@ -654,91 +754,117 @@ SR_PRIV int la2016_start_retrieval(const struct sr_dev_inst *sdi, libusb_transfe
 SR_PRIV int la2016_init_device(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc;
-	int ret;
-	uint32_t i1;
-	uint32_t i2[2];
 	uint16_t state;
-
-	/* this unknown_cmd1 seems to depend on the FPGA bitstream */
-	uint8_t unknown_cmd1_340[] = { 0xa3, 0x09, 0xc9, 0x8d, 0xe7, 0xad, 0x7a, 0x62, 0xb6, 0xd1, 0xbf };
-	uint8_t unknown_cmd1_342[] = { 0xa3, 0x09, 0xc9, 0xf4, 0x32, 0x4c, 0x4d, 0xee, 0xab, 0xa0, 0xdd };
-	uint8_t expected_unknown_resp1_340[] = { 0xa3, 0x10, 0xda, 0x66, 0x6b, 0x93, 0x5c, 0x55, 0x38, 0x50, 0x39, 0x51, 0x98, 0x86, 0x5d, 0x06, 0x7c, 0xea };
-	uint8_t expected_unknown_resp1_342[] = { 0xa3, 0x10, 0xb3, 0x92, 0x7b, 0xd8, 0x6b, 0xca, 0xa5, 0xab, 0x42, 0x6e, 0xda, 0xcd, 0x9d, 0xf1, 0x31, 0x2f };
-	uint8_t unknown_resp1[sizeof(expected_unknown_resp1_340)];
-	uint8_t *expected_unknown_resp1;
-	uint8_t *unknown_cmd1;
-
-	uint8_t unknown_cmd2[] = { 0xa3, 0x01, 0xca };
-	uint8_t expected_unknown_resp2[] = { 0xa3, 0x08, 0x06, 0x83, 0x96, 0x29, 0x15, 0xe1, 0x92, 0x74, 0x00, 0x00 };
-	uint8_t unknown_resp2[sizeof(expected_unknown_resp2)];
+	uint8_t buf[8];
+	int16_t purchase_date_bcd[2];
+	uint8_t magic;
+	int ret;
 
 	devc = sdi->priv;
 
-	if ((ret = ctrl_in(sdi, 162, 0x20, 0, &i1, sizeof(i1))) != SR_OK) {
-		sr_err("failed to read i1");
+	/* Four bytes of eeprom at 0x20 are purchase year & month in BCD format, with 16bit
+	 * complemented checksum; e.g. 2004DFFB = 2020-April.
+	 * This helps to identify the age of devices if unknown magic numbers occur.
+	 */
+	if ((ret = ctrl_in(sdi, CMD_EEPROM, 0x20, 0, purchase_date_bcd, sizeof(purchase_date_bcd))) != SR_OK) {
+		sr_err("failed to read eeprom purchase_date_bcd");
+	}
+	else {
+		sr_dbg("purchase date: 20%02hx-%02hx", (purchase_date_bcd[0]) & 0x00ff, (purchase_date_bcd[0] >> 8) & 0x00ff);
+		if (purchase_date_bcd[0] != (0x0ffff & ~purchase_date_bcd[1])) {
+			sr_err("purchase date: checksum failure");
+		}
+	}
+
+	/*
+	 * There are four known kingst logic analyser devices which use this same usb vid and pid:
+	 * LA2016, LA1016 and the older revision of each of these. They all use the same hardware
+	 * and the same FX2 mcu firmware but each requires a different fpga bitstream. They are
+	 * differentiated by a 'magic' byte within the 8 bytes of EEPROM from address 0x08.
+	 * For example;
+	 *
+	 * magic=0x08
+	 *  | ~magic=0xf7
+	 *  | |
+	 * 08F7000008F710EF
+	 *          | |
+	 *          | ~magic-backup
+	 *          magic-backup
+	 *
+	 * It seems that only these magic bytes are used, other bytes shown above are 'don't care'.
+	 * Changing the magic byte on newer device to older magic causes OEM software to load
+	 * the older fpga bitstream. The device then functions but has channels out of order.
+	 * It's likely the bitstreams were changed to move input channel pins due to PCB changes.
+	 *
+	 * magic 9 == LA1016a using "kingst-la1016a1-fpga.bitstream" (latest v1.3.0 PCB, perhaps others)
+	 * magic 8 == LA2016a using "kingst-la2016a1-fpga.bitstream" (latest v1.3.0 PCB, perhaps others)
+	 * magic 3 == LA1016 using "kingst-la1016-fpga.bitstream"
+	 * magic 2 == LA2016 using "kingst-la2016-fpga.bitstream"
+	 *
+	 * This was all determined by altering the eeprom contents of an LA2016 and LA1016 and observing
+	 * the vendor software actions, either raising errors or loading specific bitstreams.
+	 *
+	 * Note:
+	 * An LA1016 cannot be converted to an LA2016 by changing the magic number - the bitstream
+	 * will not authenticate with ic U10, which has different security coding for each device type.
+	 */
+
+	if ((ret = ctrl_in(sdi, CMD_EEPROM, 0x08, 0, &buf, sizeof(buf))) != SR_OK) {
+		sr_err("failed to read eeprom device identifier bytes");
 		return ret;
 	}
-	sr_dbg("i1: 0x%08x", i1);
 
-	if ((ret = ctrl_in(sdi, 162, 0x08, 0, &i2, sizeof(i2))) != SR_OK) {
-		sr_err("failed to read i2");
-		return ret;
+	magic = 0;
+	if (buf[0] == (0x0ff & ~buf[1])) {
+		/* primary copy of magic passes complement check */
+		magic = buf[0];
 	}
-	sr_dbg("i2: 0x%08x, 0x%08x", i2[0], i2[1]);
+	else if (buf[4] == (0x0ff & ~buf[5])) {
+		/* backup copy of magic passes complement check */
+		sr_dbg("device_type: using backup copy of magic number");
+		magic = buf[4];
+	}
 
-	if ((ret = upload_fpga_bitstream(sdi)) != SR_OK) {
+	sr_dbg("device_type: magic number is %hhu", magic);
+
+	/* select the correct fpga bitstream for this device */
+	switch (magic) {
+	case 2:
+		ret = upload_fpga_bitstream(sdi, FPGA_FW_LA2016);
+		devc->max_samplerate = MAX_SAMPLE_RATE_LA2016;
+		break;
+	case 3:
+		ret = upload_fpga_bitstream(sdi, FPGA_FW_LA1016);
+		devc->max_samplerate = MAX_SAMPLE_RATE_LA1016;
+		break;
+	case 8:
+		ret = upload_fpga_bitstream(sdi, FPGA_FW_LA2016A);
+		devc->max_samplerate = MAX_SAMPLE_RATE_LA2016;
+		break;
+	case 9:
+		ret = upload_fpga_bitstream(sdi, FPGA_FW_LA1016A);
+		devc->max_samplerate = MAX_SAMPLE_RATE_LA1016;
+		break;
+	default:
+		sr_err("device_type: device not supported; magic number indicates this is not a LA2016 or LA1016");
+		return SR_ERR;
+	}
+
+	if (ret != SR_OK) {
 		sr_err("failed to upload fpga bitstream");
 		return ret;
 	}
 
-	if (run_state(sdi) == 0xffff) {
-		sr_err("run_state after fpga bitstream upload is 0xffff!");
-		return SR_ERR;
-	}
-
-	if (devc->bitstream_size == 0x2b602) {
-		// v3.4.0
-		unknown_cmd1 = unknown_cmd1_340;
-		expected_unknown_resp1 = expected_unknown_resp1_340;
-	} else {
-		// v3.4.2
-		if (devc->bitstream_size != 0x2b839)
-			sr_warn("the FPGA bitstream size %d is unknown. tested bistreams from vendor's version 3.4.0 and 3.4.2\n", devc->bitstream_size);
-		unknown_cmd1 = unknown_cmd1_342;
-		expected_unknown_resp1 = expected_unknown_resp1_342;
-	}
-	if ((ret = ctrl_out(sdi, 96, 0x00, 0, unknown_cmd1, sizeof(unknown_cmd1_340))) != SR_OK) {
-		sr_err("failed to send unknown_cmd1");
-		return ret;
-	}
-	g_usleep(80 * 1000);
-	if ((ret = ctrl_in(sdi, 96, 0x00, 0, unknown_resp1, sizeof(unknown_resp1))) != SR_OK) {
-		sr_err("failed to read unknown_resp1");
-		return ret;
-	}
-	if (memcmp(unknown_resp1, expected_unknown_resp1, sizeof(unknown_resp1)))
-		sr_dbg("unknown_cmd1 response is not as expected, this is to be expected...");
-
 	state = run_state(sdi);
-	if (state != 0x85e9)
+	if (state != 0x85e9) {
 		sr_warn("expect run state to be 0x85e9, but it reads 0x%04x", state);
+	}
 
-	if ((ret = ctrl_out(sdi, 96, 0x00, 0, unknown_cmd2, sizeof(unknown_cmd2))) != SR_OK) {
-		sr_err("failed to send unknown_cmd2");
+	if ((ret = ctrl_out(sdi, CMD_BULK_RESET, 0x00, 0, NULL, 0)) != SR_OK) {
+		sr_err("failed to send CMD_BULK_RESET");
 		return ret;
 	}
-	g_usleep(80 * 1000);
-	if ((ret = ctrl_in(sdi, 96, 0x00, 0, unknown_resp2, sizeof(unknown_resp2))) != SR_OK) {
-		sr_err("failed to read unknown_resp2");
-		return ret;
-	}
-	if (memcmp(unknown_resp2, expected_unknown_resp2, sizeof(unknown_resp2)))
-		sr_dbg("unknown_cmd2 response is not as expected!");
 
-	if ((ret = ctrl_out(sdi, 56, 0x00, 0, NULL, 0)) != SR_OK) {
-		sr_err("failed to send unknown_cmd3");
-		return ret;
-	}
 	sr_dbg("device should be initialized");
 
 	return set_defaults(sdi);
@@ -748,7 +874,7 @@ SR_PRIV int la2016_deinit_device(const struct sr_dev_inst *sdi)
 {
 	int ret;
 
-	if ((ret = ctrl_out(sdi, 16, 0x00, 0, NULL, 0)) != SR_OK) {
+	if ((ret = ctrl_out(sdi, CMD_FPGA_ENABLE, 0x00, 0, NULL, 0)) != SR_OK) {
 		sr_err("failed to send deinit command");
 		return ret;
 	}

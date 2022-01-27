@@ -150,6 +150,8 @@ SR_PRIV int scpi_dmm_set_mq(const struct sr_dev_inst *sdi,
 	ret = sr_scpi_send(sdi->conn, command, mode);
 	if (ret != SR_OK)
 		return ret;
+	if (item->drv_flags & FLAG_CONF_DELAY)
+		g_usleep(devc->model->conf_delay_us);
 
 	return SR_OK;
 }
@@ -237,11 +239,12 @@ SR_PRIV int scpi_dmm_set_range_from_text(const struct sr_dev_inst *sdi,
 
 	is_auto = g_ascii_strcasecmp(range, "auto") == 0;
 	scpi_dmm_cmd_delay(sdi->conn);
-	ret = sr_scpi_cmd(sdi, devc->cmdset, 0, NULL,
-		is_auto ? DMM_CMD_SETUP_RANGE_AUTO : DMM_CMD_SETUP_RANGE,
-		item->scpi_func_setup, is_auto ? "" : range);
+	ret = sr_scpi_cmd(sdi, devc->cmdset, 0, NULL, DMM_CMD_SETUP_RANGE,
+		item->scpi_func_setup, is_auto ? "AUTO" : range);
 	if (ret != SR_OK)
 		return ret;
+	if (item->drv_flags & FLAG_CONF_DELAY)
+		g_usleep(devc->model->conf_delay_us);
 
 	return SR_OK;
 }
