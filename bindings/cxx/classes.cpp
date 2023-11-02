@@ -291,7 +291,7 @@ shared_ptr<Packet> Context::create_header_packet(Glib::DateTime start_time)
 {
 	auto header = g_new(struct sr_datafeed_header, 1);
 	header->feed_version = 1;
-	header->starttime.tv_sec = start_time.get_second();
+	header->starttime.tv_sec = start_time.to_unix();
 	header->starttime.tv_usec = start_time.get_microsecond();
 	auto packet = g_new(struct sr_datafeed_packet, 1);
 	packet->type = SR_DF_HEADER;
@@ -1156,9 +1156,8 @@ int Header::feed_version() const
 
 Glib::DateTime Header::start_time() const
 {
-	Glib::DateTime dt = Glib::DateTime();
-	dt.add_seconds(_structure->starttime.tv_sec + (_structure->starttime.tv_usec / 1000 / 1000));
-	return dt;
+	Glib::DateTime time = Glib::DateTime::create_now_utc(_structure->starttime.tv_sec);
+	return time.add_seconds(_structure->starttime.tv_usec / 1.0e6);
 }
 
 Meta::Meta(const struct sr_datafeed_meta *structure) :
@@ -1566,6 +1565,8 @@ Glib::VariantBase Option::parse_string(string value)
 		dt = SR_T_FLOAT;
 	} else if (g_variant_is_of_type(tmpl, G_VARIANT_TYPE_INT32)) {
 		dt = SR_T_INT32;
+	} else if (g_variant_is_of_type(tmpl, G_VARIANT_TYPE_UINT32)) {
+		dt = SR_T_UINT32;
 	} else {
 		throw Error(SR_ERR_BUG);
 	}
